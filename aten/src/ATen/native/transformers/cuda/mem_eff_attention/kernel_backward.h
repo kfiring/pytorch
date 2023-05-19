@@ -1338,7 +1338,6 @@ struct AttentionBackwardKernel {
           std::get<1>(seeds) + p.dropout_batch_head_rng_offset,
           &rng_state_init);
     }
-
     CUTLASS_PRAGMA_UNROLL
     for (; key_start < p.num_keys;
          key_start += p.num_splits_key_device() * kBlockSizeJ) {
