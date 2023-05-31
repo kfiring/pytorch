@@ -910,8 +910,14 @@ std::tuple<at::Tensor, at::Tensor, Tensor, Tensor> _efficient_attention_forward(
       offset_t = at::empty({}, at::dtype(at::kLong).device(at::kCUDA));
     }
   } else {
-    seed_t = at::empty({}, at::dtype(at::kLong));
-    offset_t = at::empty({}, at::dtype(at::kLong));
+    if (at::cuda::currentStreamCaptureStatus() !=
+        at::cuda::CaptureStatus::None) {
+      seed_t = at::empty({}, at::dtype(at::kLong).device(at::kCUDA));
+      offset_t = at::empty({}, at::dtype(at::kLong).device(at::kCUDA));
+    } else {
+      seed_t = at::empty({}, at::dtype(at::kLong));
+      offset_t = at::empty({}, at::dtype(at::kLong));
+    }
   }
 
   cudaDeviceProp* p = at::cuda::getDeviceProperties(query.device().index());
@@ -1155,37 +1161,35 @@ __global__ void rand_uniform_kernel(
  * fill tensor with random uniform values. only used for testing, not much
  * attention is paid to performance
  */
-at::Tensor& _fill_mem_eff_dropout_mask_(Tensor& self, double p) {
+at::Tensor& _fill_mem_eff_dropout_mask_(
+    Tensor& self,
+    double dropout_p,
+    const int64_t seed,
+    const int64_t offset) {
   TORCH_CHECK(self.is_contiguous());
   TORCH_CHECK(self.dtype() == at::ScalarType::Float);
   const int64_t batch_sz = self.size(0);
   const int64_t n_heads = self.size(1);
   const int64_t n_queries = self.size(2);
   const int64_t n_keys = self.size(3);
-  #if defined(USE_FLASH_ATTENTION)
-  at::CUDAGeneratorImpl* gen =
-      at::get_generator_or_default<at::CUDAGeneratorImpl>(
-          c10::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+#if defined(USE_FLASH_ATTENTION)
+
   at::PhiloxCudaState rng_engine_inputs;
-  {
-    std::lock_guard<std::mutex> lock(gen->mutex_);
-    rng_engine_inputs =
-        gen->philox_cuda_state(batch_sz * n_heads * n_queries * n_keys);
-  }
+  rng_engine_inputs = at::PhiloxCudaState(seed, offset);
   at::cuda::CUDAGuard device_guard(self.device());
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  rand_uniform_kernel<float><<<dim3(batch_sz, n_heads), n_queries, 0, stream >>>(
+  rand_uniform_kernel<float><<<dim3(batch_sz, n_heads), n_queries, 0, stream>>>(
       n_heads,
       n_queries,
       n_keys,
-      p,
+      dropout_p,
       rng_engine_inputs,
       reinterpret_cast<float*>(self.data_ptr()),
       self.numel());
 
   return self;
-  #endif
+#endif
   TORCH_CHECK(false, "USE_FLASH_ATTENTION was not enabled for build.")
   return self;
 }

@@ -14149,7 +14149,7 @@
   tags: nondeterministic_seeded
   autogen: _triton_scaled_dot_attention.out
 
-- func: _fill_mem_eff_dropout_mask_(Tensor(a!) self, float p) -> Tensor(a!)
+- func: _fill_mem_eff_dropout_mask_(Tensor(a!) self, float dropout_p, int seed, int offset) -> Tensor(a!)
   variants: function
   dispatch:
     CUDA: _fill_mem_eff_dropout_mask_

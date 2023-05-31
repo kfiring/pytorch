@@ -1882,9 +1882,9 @@ class TestSDPA(NNTestCase):
     def test_mem_efficient_attention_vs_math_ref_grads(self, device, batch_size: int, seq_len_q: int, seq_len_k: int,
                                                        head_dim: int, is_causal: bool, dropout_p: float, dtype: torch.dtype,
                                                        scale: str):
-        def _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len, p, device=device):
+        def _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len, p, seed, offset, device=device):
             mask = torch.empty((batch_size, n_heads, q_len, kv_len), device=device, dtype=torch.float32)
-            rand_uniform = torch._fill_mem_eff_dropout_mask_(mask, p)
+            rand_uniform = torch._fill_mem_eff_dropout_mask_(mask, p, seed, offset)
             mask = (rand_uniform > p).to(torch.float32)
             return mask
 
@@ -1932,7 +1932,7 @@ class TestSDPA(NNTestCase):
                 self.skipTest("Will call _fill_mem_eff_dropout_mask with too many threads!")
             # Create the dropout_mask
             torch.manual_seed(seed)
-            dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q, seq_len_k, dropout_p, device=device)
+            dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q, seq_len_k, dropout_p, seed, 0, device=device)
             # High Precision Math Reference
             out_ref = torch.ops.aten._scaled_dot_product_attention_math(
                 query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal, scale=scale, dropout_mask=dropout_mask)[0]
@@ -2091,9 +2091,9 @@ class TestSDPA(NNTestCase):
                                                                  dtype: torch.dtype,
                                                                  scale: str,
                                                                  ):
-        def _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len, p, device=device):
+        def _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len, p, seed, offset, device=device):
             mask = torch.empty((batch_size, n_heads, q_len, kv_len), device=device, dtype=torch.float32)
-            rand_uniform = torch._fill_mem_eff_dropout_mask_(mask, p)
+            rand_uniform = torch._fill_mem_eff_dropout_mask_(mask, p, seed, offset)
             mask = (rand_uniform > p).to(torch.float32)
             return mask
 
@@ -2120,35 +2120,30 @@ class TestSDPA(NNTestCase):
         torch.manual_seed(seed)
         with torch.cuda.stream(s):
             # Create real output
-            with sdp_kernel(enable_mem_efficient=True, enable_flash=False, enable_math=False):
-                # Set the seed and run the kernel
-                with sdp_kernel(enable_mem_efficient=True, enable_flash=False, enable_math=False):
-                    out = F.scaled_dot_product_attention(
-                        query, key, value, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+            output_tuple = torch.ops.aten._scaled_dot_product_efficient_attention(
+                query, key, value, compute_log_sumexp=True, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
 
         torch.cuda.current_stream().wait_stream(s)
+        out = output_tuple[0]
         upstream_grad = torch.rand_like(out, requires_grad=False)
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             out.backward(upstream_grad)
         for x in (query, key, value):
             x.grad = None
-
         g = torch.cuda.CUDAGraph()
-        # Set the global seed before graph run
-        torch.manual_seed(seed)
         # Create real output
         with torch.cuda.graph(g):
             tmp = torch.rand_like(query, device=query.device)  # test non-zero intragraph offset
             # Create real output
-            with sdp_kernel(enable_mem_efficient=True, enable_flash=False, enable_math=False):
-                # Set the seed and run the kernel
-                with sdp_kernel(enable_mem_efficient=True, enable_flash=False, enable_math=False):
-                    out = F.scaled_dot_product_attention(
-                        query, key, value, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+            output_tuple = torch.ops.aten._scaled_dot_product_efficient_attention(
+                query, key, value, compute_log_sumexp=True, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+            assert all(not isinstance(o, torch.Tensor) or o.is_cuda for o in output_tuple)
         g.replay()
-        out_first = out.clone()
+        out_first = output_tuple[0].clone()
         g.replay()
+        out = output_tuple[0]
+        ouput_seed, output_offset = output_tuple[2], output_tuple[3]
         if dropout_p == 0.0:
             self.assertEqual(out_first, out, atol=0, rtol=0)
         else:
@@ -2165,9 +2160,8 @@ class TestSDPA(NNTestCase):
                                                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
             else:
                 # Create the dropout_mask
-                torch.manual_seed(seed)
-                tmp = torch.rand_like(query, device=query.device)  # test non-zero intragraph offset
-                dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q, seq_len_k, dropout_p, device=device)
+                dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q, seq_len_k,
+                                                      dropout_p, ouput_seed, output_offset, device=device)
                 # High Precision Math Reference
                 out_ref = torch.ops.aten._scaled_dot_product_attention_math(
                     query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal,
