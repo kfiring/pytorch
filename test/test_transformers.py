@@ -2143,7 +2143,9 @@ class TestSDPA(NNTestCase):
         out_first = output_tuple[0].clone()
         g.replay()
         out = output_tuple[0]
-        ouput_seed, output_offset = output_tuple[2], output_tuple[3]
+        output_seed, output_offset = output_tuple[2], output_tuple[3]
+        output_seed = output_seed.item()
+        output_offset = output_offset.item()
         if dropout_p == 0.0:
             self.assertEqual(out_first, out, atol=0, rtol=0)
         else:
@@ -2161,7 +2163,7 @@ class TestSDPA(NNTestCase):
             else:
                 # Create the dropout_mask
                 dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q, seq_len_k,
-                                                      dropout_p, ouput_seed, output_offset, device=device)
+                                                      dropout_p, output_seed, output_offset, device=device)
                 # High Precision Math Reference
                 out_ref = torch.ops.aten._scaled_dot_product_attention_math(
                     query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal,
