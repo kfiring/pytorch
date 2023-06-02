@@ -112,8 +112,8 @@ _efficient_attention_backward(
     int64_t max_seqlen_k,
     const at::Tensor& logsumexp,
     double dropout_p, // dropout probability
-    const at::Tensor& rng_seed_tensor, // seed using for generating random numbers for dropout
-    const at::Tensor& rng_offset_tensor, // offset into random number sequence
+    const at::Tensor& philox_seed, // seed using for generating random numbers for dropout
+    const at::Tensor& philox_offset, // offset into random number sequence
     int64_t custom_mask_type,
     const c10::optional<double> scale,
     c10::optional <int64_t> num_splits_key) {
@@ -212,12 +212,12 @@ _efficient_attention_backward(
     if (at::cuda::currentStreamCaptureStatus() ==
         at::cuda::CaptureStatus::None) {
       rng_engine_inputs = at::PhiloxCudaState(
-          *rng_seed_tensor.data_ptr<int64_t>(),
-          *rng_offset_tensor.data_ptr<int64_t>());
+          *philox_seed.data_ptr<int64_t>(),
+          *philox_offset.data_ptr<int64_t>());
     } else { // dropout + capture
       rng_engine_inputs = at::PhiloxCudaState(
-          rng_seed_tensor.data_ptr<int64_t>(),
-          rng_offset_tensor.data_ptr<int64_t>(),
+          philox_seed.data_ptr<int64_t>(),
+          philox_offset.data_ptr<int64_t>(),
           0);
     }
   }
@@ -537,8 +537,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_efficient_att
     const at::Tensor& value,
     const at::Tensor& out,
     const at::Tensor& logsumexp,
-    const at::Tensor& rng_seed_tensor,
-    const at::Tensor& rng_offset_tensor,
+    const at::Tensor& philox_seed,
+    const at::Tensor& philox_offset,
     double dropout_p,
     bool causal,
     c10::optional<double> scale){
@@ -581,8 +581,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_efficient_att
           max_seqlen_k,
           logsumexp,
           dropout_p,
-          rng_seed_tensor,
-          rng_offset_tensor,
+          philox_seed,
+          philox_offset,
           static_cast<int64_t>(custom_mask_type),
           scale,
           c10::nullopt);  // num_split_keys
