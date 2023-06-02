@@ -323,6 +323,7 @@ struct AttentionKernel {
       logsumexp_ptr = warp_uniform(logsumexp_ptr);
       num_queries = warp_uniform(num_queries);
       num_keys = warp_uniform(num_keys);
+      num_keys_absolute = warp_uniform(num_keys_absolute);
       num_heads = warp_uniform(num_heads);
       head_dim = warp_uniform(head_dim);
       head_dim_value = warp_uniform(head_dim_value);

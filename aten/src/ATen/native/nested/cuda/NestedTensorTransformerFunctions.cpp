@@ -764,8 +764,7 @@ _scaled_dot_product_efficient_attention_nestedtensor_cuda(
       ? sdp::CustomMaskType::CausalFromTopLeft
       : sdp::CustomMaskType::NoCustomMask;
 
-  Tensor attention, log_sumexp, seed, offset;
-  std::tie(attention, log_sumexp, seed, offset) = at::_efficient_attention_forward(
+  auto [attention, log_sumexp, seed, offset] = at::_efficient_attention_forward(
       query_buffer_reshaped.unsqueeze(0),
       key_buffer_reshaped.unsqueeze(0),
       value_buffer_reshaped.unsqueeze(0),

@@ -2069,33 +2069,48 @@ class TestSDPA(NNTestCase):
         self.assertEqual(value.grad, value_ref.grad.to(value.grad.dtype),
                          atol=grad_v_ref_atol, rtol=grad_v_ref_rtol)
 
-
     @onlyCUDA
-    @unittest.skipIf(not PLATFORM_SUPPORTS_FUSED_SDPA, "Does not support SDPA")
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FUSED_SDPA or not SM80OrLater, "Does not support SDPA or pre-SM80 hardware")
     @parametrize("batch_size", [1, 8])
-    @parametrize("seq_len_q", [512, 1024])
-    @parametrize("seq_len_k", [512, 1024])
+    @parametrize("seq_len_q", [256, 512, 1024])
+    @parametrize("seq_len_k", [256, 512, 1024])
     @parametrize("head_dim", [32, 64])
-    @parametrize("is_causal", [False, True])
+    @parametrize("is_causal", [True, False])
     @parametrize("dropout_p", [0.0, 0.22])
     @parametrize("dtype", [torch.float16,])
     @parametrize("scale", [None, "l1"])
-    def test_mem_efficient_attention_vs_math_ref_grads_cudagraph(self,
-                                                                 device,
-                                                                 batch_size: int,
-                                                                 seq_len_q: int,
-                                                                 seq_len_k: int,
-                                                                 head_dim: int,
-                                                                 is_causal: bool,
-                                                                 dropout_p: float,
-                                                                 dtype: torch.dtype,
-                                                                 scale: str,
-                                                                 ):
-        def _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len, p, seed, offset, device=device):
+    @parametrize("fused_kernel", [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+    def test_fused_attention_vs_math_ref_grads_cudagraph(self, device, batch_size: int, seq_len_q: int, seq_len_k: int,
+                                                         head_dim: int,
+                                                         is_causal: bool,
+                                                         dropout_p: float,
+                                                         dtype: torch.dtype,
+                                                         scale: str,
+                                                         fused_kernel: SDPBackend):
+        def _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len, dropout_p, seed, offset, device=device):
             mask = torch.empty((batch_size, n_heads, q_len, kv_len), device=device, dtype=torch.float32)
-            rand_uniform = torch._fill_mem_eff_dropout_mask_(mask, p, seed, offset)
-            mask = (rand_uniform > p).to(torch.float32)
+            rand_uniform = torch._fill_mem_eff_dropout_mask_(mask, dropout_p, seed, offset)
+            mask = (rand_uniform > dropout_p).to(torch.float32)
             return mask
+
+        def get_dropout_mask(output, fused_kernel, batch_size, n_heads, q_len, kv_len, dropout_p, device=device):
+            if fused_kernel == SDPBackend.EFFICIENT_ATTENTION:
+                output_seed, output_offset = output_tuple[2], output_tuple[3]
+                output_seed = output_seed.item()
+                output_offset = output_offset.item()
+                return _get_mem_eff_drop_mask(batch_size, n_heads, q_len, kv_len,
+                                              dropout_p, output_seed, output_offset, device=device)
+            else:
+                dbug_mask = output[-1]
+                query_padding_mask = torch.ones(
+                    1, seq_len_q, device="cuda", dtype=torch.bool)
+                key_padding_mask = torch.ones(
+                    1, seq_len_k, device="cuda", dtype=torch.bool)
+
+                softmax_mask = self.convert_flash_attn_S_to_softmax(
+                    dbug_mask, query_padding_mask, key_padding_mask, head_dim=head_dim, causal=is_causal)
+                dropout_mask = softmax_mask >= 0
+                return dropout_mask
 
         seed = 42
         scale = scale if scale is None else (1 / head_dim)
@@ -2107,6 +2122,8 @@ class TestSDPA(NNTestCase):
         value = torch.rand(batch_size, n_heads, seq_len_k, head_dim,
                            device=device, dtype=dtype, requires_grad=True)
 
+        fused_op = (torch.ops.aten._scaled_dot_product_efficient_attention
+                    if fused_kernel == SDPBackend.EFFICIENT_ATTENTION else torch.ops.aten._scaled_dot_product_flash_attention)
         # Run the math kernel on low precision references
         query_ref_lp, key_ref_lp, value_ref_lp = self.query_key_value_clones(query, key, value, dtype=dtype)
 
@@ -2118,10 +2135,14 @@ class TestSDPA(NNTestCase):
         s.wait_stream(torch.cuda.current_stream())
         # Set the global seed before capture
         torch.manual_seed(seed)
+        kwargs = {"dropout_p": dropout_p, "is_causal": is_causal, "scale": scale}
+        if fused_kernel == SDPBackend.EFFICIENT_ATTENTION:
+            kwargs["compute_log_sumexp"] = True
+        if fused_kernel == SDPBackend.FLASH_ATTENTION:
+            kwargs['return_debug_mask'] = True
         with torch.cuda.stream(s):
             # Create real output
-            output_tuple = torch.ops.aten._scaled_dot_product_efficient_attention(
-                query, key, value, compute_log_sumexp=True, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+            output_tuple = fused_op(query, key, value, **kwargs)
 
         torch.cuda.current_stream().wait_stream(s)
         out = output_tuple[0]
@@ -2136,16 +2157,12 @@ class TestSDPA(NNTestCase):
         with torch.cuda.graph(g):
             tmp = torch.rand_like(query, device=query.device)  # test non-zero intragraph offset
             # Create real output
-            output_tuple = torch.ops.aten._scaled_dot_product_efficient_attention(
-                query, key, value, compute_log_sumexp=True, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+            output_tuple = fused_op(query, key, value, **kwargs)
             assert all(not isinstance(o, torch.Tensor) or o.is_cuda for o in output_tuple)
         g.replay()
         out_first = output_tuple[0].clone()
         g.replay()
         out = output_tuple[0]
-        output_seed, output_offset = output_tuple[2], output_tuple[3]
-        output_seed = output_seed.item()
-        output_offset = output_offset.item()
         if dropout_p == 0.0:
             self.assertEqual(out_first, out, atol=0, rtol=0)
         else:
@@ -2162,8 +2179,8 @@ class TestSDPA(NNTestCase):
                                                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
             else:
                 # Create the dropout_mask
-                dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q, seq_len_k,
-                                                      dropout_p, output_seed, output_offset, device=device)
+                dropout_mask = get_dropout_mask(output_tuple, fused_kernel, batch_size,
+                                                n_heads, seq_len_q, seq_len_k, dropout_p, device)
                 # High Precision Math Reference
                 out_ref = torch.ops.aten._scaled_dot_product_attention_math(
                     query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal,
@@ -2201,128 +2218,6 @@ class TestSDPA(NNTestCase):
 
         value_fudge_factor = 7 if not SM80OrLater and dtype == torch.float16 else 1.0
         grad_v_ref_atol, grad_v_ref_rtol = get_tolerances(value_ref.grad, value_ref_lp.grad, value_fudge_factor)
-
-        self.assertEqual(out, out_ref.to(out.dtype), atol=output_ref_atol, rtol=output_ref_rtol)
-        self.assertEqual(query.grad, query_ref.grad.to(query.grad.dtype),
-                         atol=grad_q_ref_atol, rtol=grad_q_ref_rtol)
-        self.assertEqual(key.grad, key_ref.grad.to(key.grad.dtype),
-                         atol=grad_k_ref_atol, rtol=grad_k_ref_rtol)
-        self.assertEqual(value.grad, value_ref.grad.to(value.grad.dtype),
-                         atol=grad_v_ref_atol, rtol=grad_v_ref_rtol)
-
-    @onlyCUDA
-    @unittest.skipIf(not PLATFORM_SUPPORTS_FUSED_SDPA or not SM80OrLater, "Does not support SDPA or pre-SM80 hardware")
-    @parametrize("batch_size", [1, 8])
-    @parametrize("seq_len_q", [512, 1024, 2048])
-    @parametrize("seq_len_k", [512, 1024, 2048])
-    @parametrize("head_dim", [32, 64])
-    @parametrize("is_causal", [True, False])
-    @parametrize("dropout_p", [0.0, 0.22])
-    @parametrize("dtype", [torch.float16,])
-    @parametrize("scale", [None, "l1"])
-    def test_flash_attention_vs_math_ref_grads_cudagraph(self, device, batch_size: int, seq_len_q: int, seq_len_k: int,
-                                                         head_dim: int,
-                                                         is_causal: bool,
-                                                         dropout_p: float,
-                                                         dtype: torch.dtype,
-                                                         scale: str):
-
-        scale = scale if scale is None else (1 / head_dim)
-        n_heads = 4
-        query = torch.rand(batch_size, n_heads, seq_len_q, head_dim,
-                           device=device, dtype=dtype, requires_grad=True)
-        key = torch.rand(batch_size, n_heads, seq_len_k, head_dim, device=device,
-                         dtype=dtype, requires_grad=True)
-        value = torch.rand(batch_size, n_heads, seq_len_k, head_dim,
-                           device=device, dtype=dtype, requires_grad=True)
-
-        # Run the math kernel on low precision references
-        query_ref_lp, key_ref_lp, value_ref_lp = self.query_key_value_clones(query, key, value, dtype=dtype)
-
-        higher_precision_dtype = torch.float64 if dtype == torch.float32 else torch.float32
-        query_ref, key_ref, value_ref = self.query_key_value_clones(query, key, value, dtype=higher_precision_dtype)
-
-        is_dropout = dropout_p > 0.0
-        # warmup
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            output_tuple = torch.ops.aten._scaled_dot_product_flash_attention(
-                query, key, value, dropout_p=dropout_p, is_causal=is_causal, scale=scale, return_debug_mask=True)
-        torch.cuda.current_stream().wait_stream(s)
-        out = output_tuple[0]
-        dbug_mask = output_tuple[-1]
-        upstream_grad = torch.rand_like(out, requires_grad=False)
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            out.backward(upstream_grad)
-        for x in (query, key, value):
-            x.grad = None
-
-        g = torch.cuda.CUDAGraph()
-        # Create real output
-        with torch.cuda.graph(g):
-            tmp = torch.rand_like(query, device=query.device)  # test non-zero intragraph offset
-            output_tuple = torch.ops.aten._scaled_dot_product_flash_attention(
-                query, key, value, dropout_p=dropout_p, is_causal=is_causal, scale=scale, return_debug_mask=True)
-            assert all(not isinstance(o, torch.Tensor) or o.is_cuda for o in output_tuple)
-        g.replay()
-        out_first = output_tuple[0].clone()
-        dbug_mask_first = output_tuple[-1].clone()
-        g.replay()
-        out = output_tuple[0]
-        dbug_mask = output_tuple[-1]
-        if not is_dropout:
-            self.assertEqual(out_first, out, atol=0, rtol=0)
-        else:
-            # replays produce different results
-            self.assertNotEqual(out_first, out)
-
-        query_padding_mask = torch.ones(
-            1, seq_len_q, device="cuda", dtype=torch.bool)
-        key_padding_mask = torch.ones(
-            1, seq_len_k, device="cuda", dtype=torch.bool)
-
-        softmax_mask = self.convert_flash_attn_S_to_softmax(
-            dbug_mask, query_padding_mask, key_padding_mask, head_dim=head_dim, causal=is_causal)
-        dropout_mask = softmax_mask >= 0
-
-        if not is_dropout:
-            with sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False):
-                # High Precision Math Reference
-                out_ref = F.scaled_dot_product_attention(
-                    query_ref, key_ref, value_ref, is_causal=is_causal, scale=scale)
-                # Low Precision Math Reference
-                out_lp_ref = F.scaled_dot_product_attention(
-                    query_ref_lp, key_ref_lp, value_ref_lp, is_causal=is_causal, scale=scale)
-        else:
-            # High Precision Math Reference
-            out_ref = torch.ops.aten._scaled_dot_product_attention_math(
-                query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal, scale=scale, dropout_mask=dropout_mask)[0]
-            # Low Precision Math Reference
-            out_lp_ref = torch.ops.aten._scaled_dot_product_attention_math(
-                query_ref_lp, key_ref_lp, value_ref_lp, dropout_p=dropout_p, is_causal=is_causal, scale=scale,
-                dropout_mask=dropout_mask)[0]
-
-        upstream_grad = torch.rand_like(out, requires_grad=False)
-
-        g1 = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g1):
-            out.backward(upstream_grad)
-        g1.replay()
-        out_ref.backward(upstream_grad.to(out_ref.dtype))
-        out_lp_ref.backward(upstream_grad.to(out_lp_ref.dtype))
-
-        # See [Note] Fused Tolerances above
-        output_ref_atol, output_ref_rtol = get_tolerances(out_ref, out_lp_ref)
-
-        # TODO: Investigate why grad_q needs larger tolerances
-        query_fudge_factor = 4
-        grad_q_ref_atol, grad_q_ref_rtol = get_tolerances(query_ref.grad, query_ref_lp.grad, query_fudge_factor)
-
-        grad_k_ref_atol, grad_k_ref_rtol = get_tolerances(key_ref.grad, key_ref_lp.grad)
-
-        grad_v_ref_atol, grad_v_ref_rtol = get_tolerances(value_ref.grad, value_ref_lp.grad)
 
         self.assertEqual(out, out_ref.to(out.dtype), atol=output_ref_atol, rtol=output_ref_rtol)
         self.assertEqual(query.grad, query_ref.grad.to(query.grad.dtype),

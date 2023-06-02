@@ -729,8 +729,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> _scaled_dot_product_efficient_attenti
       ? sdp::CustomMaskType::CausalFromTopLeft
       : sdp::CustomMaskType::NoCustomMask;
 
-  Tensor attention, log_sumexp, seed, offset;
-  std::tie(attention, log_sumexp, seed, offset) = at::_efficient_attention_forward(
+  auto [attention, log_sumexp, seed, offset] = at::_efficient_attention_forward(
       q_t,
       k_t,
       v_t,
@@ -1075,7 +1074,11 @@ std::tuple<at::Tensor, at::Tensor, Tensor, Tensor> _efficient_attention_forward(
   TORCH_CHECK(kernel_launched, "cutlassF: no kernel found to launch!");
   AT_CUDA_CHECK(cudaGetLastError());
 
-  return std::make_tuple(res, logsumexp, seed_t, offset_t);
+  return std::make_tuple(
+      std::move(res),
+      std::move(logsumexp),
+      std::move(seed_t),
+      std::move(offset_t));
 #endif
   TORCH_CHECK(false, "USE_FLASH_ATTENTION was not enabled for build.")
   return std::make_tuple(Tensor{}, Tensor{}, Tensor{}, Tensor{});

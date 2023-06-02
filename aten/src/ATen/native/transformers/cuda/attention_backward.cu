@@ -537,8 +537,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_efficient_att
     const at::Tensor& value,
     const at::Tensor& out,
     const at::Tensor& logsumexp,
-    const at::Tensor& rng_seed_tensor, // seed using for generating random numbers for dropout
-    const at::Tensor& rng_offset_tensor, // offset into random number sequence
+    const at::Tensor& rng_seed_tensor,
+    const at::Tensor& rng_offset_tensor,
     double dropout_p,
     bool causal,
     c10::optional<double> scale){
