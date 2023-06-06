@@ -318,6 +318,7 @@ def emit_metric(
         }
     except ValueError as e:
         warn(f"Not emitting metrics. {e}")
+        raise
         return
 
     # Prefix key with metric name and timestamp to derisk chance of a uuid1 name collision
@@ -346,4 +347,5 @@ def emit_metric(
         # We don't want to fail the job if we can't upload the metric.
         # We still raise the ValueErrors outside this try block since those indicate improperly configured metrics
         warn(f"Error uploading metric to DynamoDB: {e}")
+        raise
         return
