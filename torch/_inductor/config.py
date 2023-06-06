@@ -200,6 +200,15 @@ profile_bandwidth_regex: str = "" if _profile_var == "1" else _profile_var
 disable_cpp_codegen: bool = ConfigMixin.is_fbcode()
 
 
+# Runs constant folding upon inductor compilation, freezing the values of parameters
+# and buffers
+freezing: bool = False
+
+# Make freezing invalidate the eager Parameters of nn modules, to avoid memory overhead
+# of potentially keeping multiple copies of weights
+freezing_discard_parameters: bool = False
+
+
 # config specific to codegen/cpp.pp
 @dataclasses.dataclass
 class CppConfig(ConfigMixin):
