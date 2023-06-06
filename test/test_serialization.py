@@ -3436,10 +3436,33 @@ class TestSerialization(TestCase, SerializationMixin):
             self.assertTrue(torch.equal(tensor_be_no_bom, tensor_le_bom))
             self.assertTrue(torch.equal(tensor_be_no_bom, tensor_be_bom))
 
+    @parametrize('weights_only', (True, False))
+    def test_serialization_mmap_loading(self, weights_only):
+        class DummyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc1 = torch.nn.Linear(3, 1024)
+                self.fc2 = torch.nn.Linear(1024, 5)
+
+            def forward(self, input):
+                return self.fc2(self.fc1(input))
+
+        with TemporaryFileName() as f:
+            state_dict = DummyModel().state_dict()
+            torch.save(state_dict, f)
+            result = torch.load(f, _mmap=True, weights_only=weights_only)
+            result_non_mmap = torch.load(f, _mmap=False, weights_only=weights_only)
+
+        model_mmap_state_dict = DummyModel()
+        model_mmap_state_dict.load_state_dict(result)
+        model_non_mmap_state_dict = DummyModel()
+        model_non_mmap_state_dict.load_state_dict(result_non_mmap)
+        input = torch.randn(4, 3)
+        self.assertEqual(model_mmap_state_dict(input), model_non_mmap_state_dict(input.clone()))
+
     def run(self, *args, **kwargs):
         with serialization_method(use_zip=True):
             return super().run(*args, **kwargs)
-
 
 class TestWrapperSubclass(torch.Tensor):
     elem: torch.Tensor
